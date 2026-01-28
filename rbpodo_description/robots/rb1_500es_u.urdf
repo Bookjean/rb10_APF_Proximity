@@ -148,7 +148,7 @@
     <limit effort="10" lower="-3.14" upper="3.14" velocity="3.14"/>
   </joint>
   <joint name="wrist2" type="revolute">
-    <origin rpy="0 0 0" xyz="0 -0.0948 0.2198"/>
+    <origin rpy="0 0 0" xyz="0 0 0.2198"/>
     <parent link="link4"/>
     <child link="link5"/>
     <axis xyz="0 1 0"/>
