@@ -1,0 +1,42 @@
+proximity_controller:
+  ros__parameters:
+    control_rate: 100.0
+    dt: 0.01
+    joint_names: [base, shoulder, elbow, wrist1, wrist2, wrist3]
+    q_min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+    q_max: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+    # APF parameters
+    k_att: 2.0
+    k_rep: 5.0
+    k_q: 1.0
+    v_max: 1.0
+    d0: 0.15              # proximity sensor influence distance (m) = 150mm
+    ema_alpha: 0.3
+    goal_tolerance: 0.005
+    q_limit_margin: 0.1
+    r_min: 0.02
+    # Sensor visualization
+    sensor_fov: 1.7        # ~97 deg
+    sensor_range: 0.2
+    sensor_marker_size: 0.1
+    # EE offset from link6
+    ee_offset: [0.0, -0.1153, 0.0]
+    # P2P waypoint settings
+    waypoint_tolerance: 0.02   # rad, joint-space tolerance for waypoint reached
+
+waypoint_manager:
+  ros__parameters:
+    waypoint_file: "waypoints.yaml"
+    save_directory: ""   # empty = default config directory
+    joint_names: [base, shoulder, elbow, wrist1, wrist2, wrist3]
+    auto_load: true
+
+fake_proximity_publisher:
+  ros__parameters:
+    publish_rate: 100.0
+    max_range: 200.0         # mm
+    default_range: 200.0     # mm (no obstacle)
+    obstacle_sim_enabled: false
+    obstacle_position: [0.3, 0.0, 0.8]
+    detect_fov: 1.7
+    threshold_mm: 150.0

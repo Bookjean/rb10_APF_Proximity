@@ -1,0 +1,29 @@
+apf_controller:
+  ros__parameters:
+    control_rate: 100.0
+    dt: 0.01
+    joint_names: [base, shoulder, elbow, wrist1, wrist2, wrist3]
+    q_min: [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+    q_max: [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+    k_att: 2.0
+    k_rep: 5.0
+    k_q: 1.0
+    v_max: 1.0
+    q_limit_margin: 0.1
+    goal_tolerance: 0.005
+    d0: 0.2
+    ema_alpha: 0.3
+    r_min: 0.02
+    tof_fov: 1.7     # ToF FOV (rad), ~97 deg
+    tof_range: 0.2          # ToF range (m) — visualization & repulsive influence
+    tof_marker_size: 0.1  # ToF sensor sphere size (m)
+    ee_offset: [0.0, -0.1153, 0.0]  # EE offset from link6 (link6 local frame)
+
+fake_tof_publisher:
+  ros__parameters:
+    publish_rate: 30.0
+    max_range: 0.2
+    default_range: 0.2
+    obstacle_sim_enabled: false
+    obstacle_position: [0.3, 0.0, 0.8]
+    tof_detect_fov: 1.7      # detection FOV (rad), matches visualization

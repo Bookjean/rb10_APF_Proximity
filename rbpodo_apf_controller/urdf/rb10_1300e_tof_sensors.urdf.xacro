@@ -1,0 +1,40 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="tof_sensors_on_link3" params="prefix=''">
+
+    <!-- ToF North: +X direction on link3 -->
+    <link name="${prefix}tof_N" />
+    <joint name="${prefix}tof_N_joint" type="fixed">
+      <origin xyz="0.06 0.1484 0.285075" rpy="0 0 0" />
+      <parent link="${prefix}link3" />
+      <child link="${prefix}tof_N" />
+    </joint>
+
+    <!-- ToF South: -X direction on link3 -->
+    <link name="${prefix}tof_S" />
+    <joint name="${prefix}tof_S_joint" type="fixed">
+      <origin xyz="-0.06 0.1484 0.285075" rpy="0 0 3.14159265359" />
+      <parent link="${prefix}link3" />
+      <child link="${prefix}tof_S" />
+    </joint>
+
+    <!-- ToF East: -Y direction on link3 -->
+    <link name="${prefix}tof_E" />
+    <joint name="${prefix}tof_E_joint" type="fixed">
+      <origin xyz="0 0.0884 0.285075" rpy="0 0 -1.5707963268" />
+      <parent link="${prefix}link3" />
+      <child link="${prefix}tof_E" />
+    </joint>
+
+    <!-- ToF West: +Y direction on link3 -->
+    <link name="${prefix}tof_W" />
+    <joint name="${prefix}tof_W_joint" type="fixed">
+      <origin xyz="0 0.2084 0.285075" rpy="0 0 1.5707963268" />
+      <parent link="${prefix}link3" />
+      <child link="${prefix}tof_W" />
+    </joint>
+
+  </xacro:macro>
+
+</robot>
