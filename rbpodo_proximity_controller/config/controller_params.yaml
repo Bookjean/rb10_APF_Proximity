@@ -10,7 +10,7 @@ proximity_controller:
     k_rep: 5.0
     k_q: 1.0
     v_max: 1.0
-    d0: 0.15              # proximity sensor influence distance (m) = 150mm
+    d0: 0.10              # proximity sensor influence distance (m) = 100mm (10cm)
     ema_alpha: 0.3
     goal_tolerance: 0.005
     q_limit_margin: 0.1

@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Interactive launcher for APF hybrid controller.
+
+This script can be run directly:
+    python3 apf_hybrid_interactive
+    or
+    ./apf_hybrid_interactive
+"""
+
+import sys
+import os
+
+# Add launch directory to path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+launch_dir = os.path.join(os.path.dirname(script_dir), 'launch')
+sys.path.insert(0, launch_dir)
+
+# Import and run the interactive launcher
+from apf_hybrid_interactive import main
+
+if __name__ == "__main__":
+    main()
+

@@ -6,3 +6,4 @@ log/
 __pycache__/
 *.pyc
 *.swp
+apf_venv/

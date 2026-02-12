@@ -17,12 +17,55 @@ source install/setup.bash
 
 ## 실행
 
+### 대화형 런처 (권장)
+
+런치 실행 시 대화형으로 센서 모드를 선택할 수 있습니다:
+
+```bash
+python3 $(ros2 pkg prefix rbpodo_apf_controller)/share/rbpodo_apf_controller/launch/apf_demo_interactive.py
+```
+
+또는 워크스페이스에서 직접 실행:
+
+```bash
+cd ~/rb_ws/src/rb10_APF_Proximity/rbpodo_apf_controller
+python3 launch/apf_demo_interactive.py
+```
+
+실행하면 다음과 같이 선택할 수 있습니다:
+1. 센서 모드 선택 (가짜 ToF 센서 / 실제 센서)
+2. 장애물 시뮬레이션 활성화 여부 (가짜 센서 모드일 때만)
+
+### 기본 실행 (가짜 ToF 센서 모드)
+
 ```bash
 ros2 launch rbpodo_apf_controller apf_demo.launch.py
 ```
 
 RViz가 자동으로 열리며 로봇이 q=0 자세로 표시된다.
 ToF 센서 FOV 콘(청록 와이어프레임)이 항상 표시된다.
+
+### 센서 모드 선택 (수동)
+
+**가짜 ToF 센서 모드 (시뮬레이션, 기본값):**
+```bash
+ros2 launch rbpodo_apf_controller apf_demo.launch.py use_real_sensor:=false
+```
+- `/link3_tof_{N,S,E,W}/range` 토픽 사용
+- `fake_tof_publisher` 노드가 가짜 센서 데이터 발행
+- 장애물 시뮬레이션 가능 (`obstacle_sim_enabled:=true`)
+
+**실제 센서 모드:**
+```bash
+ros2 launch rbpodo_apf_controller apf_demo.launch.py use_real_sensor:=true
+```
+- `/proximity_distance` 토픽 사용 (Float32MultiArray, mm 단위)
+- 실제 하드웨어 센서 데이터 사용
+- `fake_tof_publisher` 노드가 자동으로 비활성화됨
+
+**참고:**
+- `use_real_sensor:=true`일 때는 실제 센서 데이터가 `/proximity_distance` 토픽으로 발행되어야 합니다
+- 센서 데이터 형식: `[N, S, E, W]` 거리값 (mm) 또는 단일 값 (모든 센서에 동일 적용)
 
 ---
 
@@ -52,6 +95,20 @@ ros2 topic pub /apf_goal geometry_msgs/PointStamped "{header: {frame_id: link0},
 
 ## APF 켜기/끄기
 
+### 초기 상태 설정
+
+APF의 초기 상태는 `apf_params.yaml`에서 설정할 수 있습니다:
+
+- `apf_enabled_on_start`: 시작 시 APF 활성화 여부 (기본값: `true`)
+  - `true`: 시작 시 APF 활성화 (목표점을 받으면 즉시 동작)
+  - `false`: 시작 시 APF 비활성화 (수동으로 켜야 함)
+
+- `auto_enable_on_goal`: 목표점 수신 시 자동 활성화 여부 (기본값: `true`)
+  - `true`: 목표점을 받으면 자동으로 APF 활성화
+  - `false`: 목표점을 받아도 수동으로 켜야 함
+
+### 런타임에서 APF 켜기/끄기
+
 서비스를 사용하여 APF 제어를 토글할 수 있다. 꺼도 시각화(마커, FOV)는 유지된다.
 
 ```bash
@@ -61,6 +118,11 @@ ros2 service call /apf_controller/enable std_srvs/srv/SetBool "{data: false}"
 # APF 켜기
 ros2 service call /apf_controller/enable std_srvs/srv/SetBool "{data: true}"
 ```
+
+**참고:**
+- APF가 꺼져있으면 목표점을 받아도 로봇이 움직이지 않습니다
+- `auto_enable_on_goal: true`일 때는 목표점을 받으면 자동으로 활성화됩니다
+- `auto_enable_on_goal: false`일 때는 목표점을 받아도 경고만 표시되고 수동으로 켜야 합니다
 
 ---
 
@@ -133,6 +195,8 @@ ros2 service call /fake_tof_publisher/clear_obstacles std_srvs/srv/Trigger
 | `control_rate` | 100.0 | 제어 루프 주기 (Hz) |
 | `dt` | 0.01 | 적분 시간 간격 (s) |
 | `ema_alpha` | 0.3 | ToF EMA 필터 계수 (0~1, 클수록 빠른 반응) |
+| `apf_enabled_on_start` | true | 시작 시 APF 활성화 여부 |
+| `auto_enable_on_goal` | true | 목표점 수신 시 자동 활성화 여부 |
 
 ### EE / 센서 파라미터
 
@@ -141,6 +205,8 @@ ros2 service call /fake_tof_publisher/clear_obstacles std_srvs/srv/Trigger
 | `ee_offset` | [0, -0.1153, 0] | link6 로컬 프레임에서 EE 오프셋 (m) |
 | `tof_fov` | 0.174533 | ToF 시야각 (rad, ~10 deg) |
 | `tof_range` | 0.5 | ToF FOV 시각화 거리 (m) |
+| `use_real_sensor` | false | 실제 센서 모드 사용 여부 |
+| `proximity_max_range_mm` | 200.0 | 근접 센서 최대 범위 (mm) |
 
 ---
 
@@ -154,7 +220,8 @@ ros2 service call /fake_tof_publisher/clear_obstacles std_srvs/srv/Trigger
 | `/apf_goal` | PointStamped | 구독 | 목표점 (frame_id: link0) |
 | `/add_obstacle` | PointStamped | 구독 | 장애물 추가 (좌표 입력) |
 | `/clicked_point` | PointStamped | 구독 | 장애물 추가 (RViz 클릭) |
-| `/link3_tof_{N,S,E,W}/range` | Range | 구독 | ToF 센서 거리값 |
+| `/link3_tof_{N,S,E,W}/range` | Range | 구독 | ToF 센서 거리값 (가짜 센서 모드) |
+| `/proximity_distance` | Float32MultiArray | 구독 | 실제 근접 센서 거리값 (mm, 실제 센서 모드) |
 | `/position_controllers/commands` | Float64MultiArray | 발행 | 관절 위치 명령 |
 | `/apf_debug/markers` | MarkerArray | 발행 | APF 디버그 시각화 |
 | `/obstacle_markers` | MarkerArray | 발행 | 장애물 시각화 |

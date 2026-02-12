@@ -18,6 +18,8 @@ setup(
             glob('launch/*.py')),
         (os.path.join('share', package_name, 'urdf'),
             glob('urdf/*')),
+        (os.path.join('share', package_name, 'scripts'),
+            glob('scripts/*') if os.path.exists('scripts') else []),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -32,6 +34,9 @@ setup(
             'fake_tof_publisher = rbpodo_apf_controller.fake_tof_publisher:main',
             'go_home = rbpodo_apf_controller.go_home:main',
             'go_home_keep_obs = rbpodo_apf_controller.go_home_keep_obs:main',
+            'trajectory_manager = rbpodo_apf_controller.trajectory_manager:main',
+            'rb10_command_bridge = rbpodo_apf_controller.rb10_command_bridge:main',
+            'joint_state_mapper = rbpodo_apf_controller.joint_state_mapper:main',
         ],
     },
 )

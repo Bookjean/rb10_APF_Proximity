@@ -27,8 +27,10 @@ setup(
     entry_points={
         'console_scripts': [
             'proximity_controller = rbpodo_proximity_controller.proximity_controller_node:main',
+            'sim_real_hybrid_controller = rbpodo_proximity_controller.sim_real_hybrid_controller:main',
             'waypoint_manager = rbpodo_proximity_controller.waypoint_manager:main',
             'fake_proximity_publisher = rbpodo_proximity_controller.fake_proximity_publisher:main',
+            'joint_state_mapper = rbpodo_proximity_controller.joint_state_mapper:main',
         ],
     },
 )

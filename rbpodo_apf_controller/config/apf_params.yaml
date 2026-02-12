@@ -11,13 +11,19 @@ apf_controller:
     v_max: 1.0
     q_limit_margin: 0.1
     goal_tolerance: 0.005
-    d0: 0.2
+    d0: 0.1  # 반발력 활성 거리 (m) = 100mm (10cm)
     ema_alpha: 0.3
     r_min: 0.02
     tof_fov: 1.7     # ToF FOV (rad), ~97 deg
     tof_range: 0.2          # ToF range (m) — visualization & repulsive influence
     tof_marker_size: 0.1  # ToF sensor sphere size (m)
     ee_offset: [0.0, -0.1153, 0.0]  # EE offset from link6 (link6 local frame)
+    use_real_sensor: true  # Use real proximity_distance topic instead of fake ToF sensors (기본값: 실제 센서 사용)
+    proximity_max_range_mm: 200.0  # Max range in mm for proximity sensor
+    use_individual_proximity_sensors: true  # Use individual /proximity_distance1-4 topics (Range type) instead of aggregated /proximity_distance (기본값: 개별 센서 토픽 사용)
+    proximity_sensor_mapping: [1, 2, 3, 4]  # Sensor IDs for [N, S, E, W] directions (e.g., [1,2,3,4] means proximity_distance1=N, proximity_distance2=S, etc.)
+    apf_enabled_on_start: true  # APF enabled state on startup (true = enabled, false = disabled)
+    auto_enable_on_goal: true  # Automatically enable APF when goal is received (true = auto-enable, false = manual only)
 
 fake_tof_publisher:
   ros__parameters:

@@ -10,7 +10,7 @@ import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Range
 from std_msgs.msg import Float64MultiArray, Float32MultiArray, Int32
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
@@ -113,6 +113,7 @@ class ProximityController(Node):
         self.q = None
         self.proximity_distance = None  # raw distance in mm
         self.proximity_filtered = float('inf')  # EMA filtered, in meters
+        self.proximity_ranges = {}  # dict of sensor_id -> range (meters)
         self.waypoints = []  # list of joint position arrays
         self.current_waypoint_idx = 0
         self.executing = False
@@ -126,6 +127,12 @@ class ProximityController(Node):
             Float32MultiArray, '/proximity_distance',
             self._proximity_distance_cb, 10
         )
+        # Subscribe to individual proximity sensor Range topics
+        for i in range(1, 9):
+            self.create_subscription(
+                Range, f'/proximity_distance{i}',
+                lambda msg, idx=i: self._proximity_range_cb(msg, idx), 10
+            )
         self.create_subscription(
             Float64MultiArray, '/waypoint_manager/waypoints',
             self._waypoints_cb, 10
@@ -222,6 +229,14 @@ class ProximityController(Node):
         else:
             self.proximity_filtered = alpha * raw_m + (1.0 - alpha) * prev
         self.proximity_distance = raw_mm
+
+    def _proximity_range_cb(self, msg, sensor_id):
+        """Process individual proximity sensor Range message.
+        
+        msg.range is in meters.
+        """
+        if msg.range >= 0 and msg.range <= msg.max_range:
+            self.proximity_ranges[sensor_id] = msg.range
 
     def _waypoints_cb(self, msg):
         """Parse waypoints from waypoint_manager.
@@ -521,8 +536,10 @@ class ProximityController(Node):
             m.lifetime = lifetime
             ma.markers.append(m)
 
-        # Sensor position spheres (cyan)
-        for _direction, p_s, R_sw in sensor_vis:
+        # Sensor position spheres (cyan) with distance info
+        sensor_directions = ['N', 'S', 'E', 'W']
+        for idx, (direction, p_s, R_sw) in enumerate(sensor_vis):
+            # Sensor sphere
             m = Marker()
             m.header.stamp = stamp
             m.header.frame_id = frame_id
@@ -542,6 +559,58 @@ class ProximityController(Node):
             m.color.a = 0.8
             m.lifetime = lifetime
             ma.markers.append(m)
+            
+            # Distance text (if available)
+            sensor_id = idx + 1  # 1-4 for N, S, E, W
+            if sensor_id in self.proximity_ranges:
+                dist_m = self.proximity_ranges[sensor_id]
+                dist_mm = dist_m * 1000.0
+                m_text = Marker()
+                m_text.header.stamp = stamp
+                m_text.header.frame_id = frame_id
+                m_text.ns = 'proximity'
+                m_text.id = marker_id
+                marker_id += 1
+                m_text.type = Marker.TEXT_VIEW_FACING
+                m_text.action = Marker.ADD
+                m_text.pose.position.x = float(p_s[0])
+                m_text.pose.position.y = float(p_s[1])
+                m_text.pose.position.z = float(p_s[2]) + 0.05
+                m_text.pose.orientation.w = 1.0
+                m_text.scale.z = 0.02
+                m_text.color.r = 1.0
+                m_text.color.g = 1.0
+                m_text.color.b = 0.0
+                m_text.color.a = 1.0
+                m_text.text = f'{direction}: {dist_mm:.0f}mm'
+                m_text.lifetime = lifetime
+                ma.markers.append(m_text)
+                
+                # Distance arrow/line (if distance is valid)
+                if dist_m > 0 and dist_m < 0.5:  # Show if within 50cm
+                    look_dir = -(R_sw @ np.array([1.0, 0.0, 0.0]))
+                    end_point = p_s + look_dir * dist_m
+                    m_arrow = Marker()
+                    m_arrow.header.stamp = stamp
+                    m_arrow.header.frame_id = frame_id
+                    m_arrow.ns = 'proximity'
+                    m_arrow.id = marker_id
+                    marker_id += 1
+                    m_arrow.type = Marker.ARROW
+                    m_arrow.action = Marker.ADD
+                    m_arrow.points = [
+                        Point(x=float(p_s[0]), y=float(p_s[1]), z=float(p_s[2])),
+                        Point(x=float(end_point[0]), y=float(end_point[1]), z=float(end_point[2]))
+                    ]
+                    m_arrow.scale.x = 0.01
+                    m_arrow.scale.y = 0.02
+                    m_arrow.scale.z = 0.0
+                    m_arrow.color.r = 1.0
+                    m_arrow.color.g = 0.5
+                    m_arrow.color.b = 0.0
+                    m_arrow.color.a = 0.8
+                    m_arrow.lifetime = lifetime
+                    ma.markers.append(m_arrow)
 
         # Proximity status text
         m = Marker()

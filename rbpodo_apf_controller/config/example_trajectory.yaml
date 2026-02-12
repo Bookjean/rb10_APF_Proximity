@@ -1,0 +1,39 @@
+# Example trajectory YAML file for APF controller
+# Positions are defined as [x, y, z] in link0 frame (meters)
+
+positions:
+  home:
+    - 0.3
+    - 0.0
+    - 0.5
+  waypoint1:
+    - 0.4
+    - 0.1
+    - 0.4
+  waypoint2:
+    - 0.4
+    - -0.1
+    - 0.4
+  waypoint3:
+    - 0.3
+    - -0.1
+    - 0.5
+  waypoint4:
+    - 0.3
+    - 0.1
+    - 0.5
+
+# Trajectories are sequences of position names
+trajectories:
+  demo_path:
+    - home
+    - waypoint1
+    - waypoint2
+    - waypoint3
+    - waypoint4
+    - home
+  simple_path:
+    - home
+    - waypoint1
+    - home
+

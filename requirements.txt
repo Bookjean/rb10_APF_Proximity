@@ -1,0 +1,13 @@
+# Python dependencies for rb10_APF_Proximity packages
+# ROS2 packages (rclpy, sensor_msgs, etc.) are installed via apt and should not be in venv
+# PyKDL is also installed via apt (python3-orocos-kdl or ros-humble-orocos-kdl)
+
+# Core scientific computing
+numpy>=1.20.0
+
+# YAML file parsing
+PyYAML>=5.4.0
+
+# Setuptools for package installation
+setuptools>=45.0.0
+

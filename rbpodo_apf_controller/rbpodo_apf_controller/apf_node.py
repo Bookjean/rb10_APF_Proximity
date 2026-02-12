@@ -11,7 +11,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState, Range
 from geometry_msgs.msg import Point, PointStamped
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Float32MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 from builtin_interfaces.msg import Duration
 from std_srvs.srv import SetBool
@@ -61,6 +61,15 @@ class APFController(Node):
         self.declare_parameter("tof_range", 0.5)
         self.declare_parameter("tof_marker_size", 0.06)  # sensor sphere diameter (m)
         self.declare_parameter("ee_offset", [0.0, -0.1153, 0.0])
+        self.declare_parameter("use_real_sensor", False)  # Use proximity_distance topic instead of ToF topics
+        self.declare_parameter("proximity_max_range_mm", 200.0)  # Max range in mm for proximity sensor
+        self.declare_parameter("use_individual_proximity_sensors", False)  # Use individual /proximity_distance1-4 topics (Range type)
+        self.declare_parameter("proximity_sensor_mapping", [1, 2, 3, 4])  # Sensor IDs for [N, S, E, W] directions
+        self.declare_parameter("apf_enabled_on_start", True)  # APF enabled state on startup
+        self.declare_parameter("auto_enable_on_goal", True)  # Automatically enable APF when goal is received
+        self.declare_parameter("simulation_mode", True)  # True = sim only, False = real+sim
+        self.declare_parameter("real_robot_ip", "192.168.111.50")  # Real robot IP address (changed to match robotory_rb10_ros2 default)
+        self.declare_parameter("robot_mode", "rviz_sim")  # "rviz_sim", "real"
 
         # Read parameters
         self.control_rate = self.get_parameter("control_rate").value
@@ -80,6 +89,26 @@ class APFController(Node):
         self.tof_fov = self.get_parameter("tof_fov").value
         self.tof_range = self.get_parameter("tof_range").value
         self.tof_marker_size = self.get_parameter("tof_marker_size").value
+        self.use_real_sensor = self.get_parameter("use_real_sensor").value
+        self.proximity_max_range_mm = self.get_parameter("proximity_max_range_mm").value
+        self.use_individual_proximity_sensors = self.get_parameter("use_individual_proximity_sensors").value
+        # Parse proximity_sensor_mapping (can be string or list)
+        mapping_param = self.get_parameter("proximity_sensor_mapping").value
+        if isinstance(mapping_param, str):
+            # Parse string like "[1, 2, 3, 4]" to list
+            import ast
+            try:
+                self.proximity_sensor_mapping = ast.literal_eval(mapping_param)
+            except:
+                self.proximity_sensor_mapping = [1, 2, 3, 4]  # default
+                self.get_logger().warn(f"Failed to parse proximity_sensor_mapping '{mapping_param}', using default [1,2,3,4]")
+        else:
+            self.proximity_sensor_mapping = mapping_param  # [N, S, E, W] sensor IDs
+        apf_enabled_on_start = self.get_parameter("apf_enabled_on_start").value
+        self.auto_enable_on_goal = self.get_parameter("auto_enable_on_goal").value
+        self.simulation_mode = self.get_parameter("simulation_mode").value
+        self.real_robot_ip = self.get_parameter("real_robot_ip").value
+        self.robot_mode = self.get_parameter("robot_mode").value  # "rviz_sim", "real"
 
         # Build KDL chains
         ee_offset = self.get_parameter("ee_offset").value
@@ -92,34 +121,98 @@ class APFController(Node):
             self.sensor_R_local[name] = rpy_to_rotation_matrix(*cfg["rpy"])
 
         # State
-        self.q = None  # Current joint positions (6,)
+        self.q = None  # Current joint positions (6,) - simulation robot
+        self.q_real = None  # Real robot joint positions (for initial pose sync)
+        self.q_real_initial = None  # Real robot initial pose (set once)
+        self.initial_pose_synced = False
         self.p_goal = None  # Goal position in link0 frame (3,)
         self.tof_filtered = {d: float("inf") for d in SENSOR_CONFIGS}
 
         # Subscribers
+        # Subscribe to both /joint_states (rviz_sim) and /rbpodo/joint_states (real robot)
+        # Simulation robot joint states (from joint_state_publisher)
         self.create_subscription(JointState, "/joint_states", self._joint_states_cb, 10)
+        # Real robot joint states (from rbpodo_bringup, if available)
+        self.create_subscription(JointState, "/rbpodo/joint_states", self._real_joint_states_cb, 10)
         self.create_subscription(PointStamped, "/apf_goal", self._goal_cb, 10)
-        for direction in SENSOR_CONFIGS:
-            self.create_subscription(
-                Range,
-                f"/link3_tof_{direction}/range",
-                lambda msg, d=direction: self._tof_cb(msg, d),
-                10,
-            )
+        
+        # Sensor data subscription: either real proximity_distance or individual ToF topics
+        if self.use_real_sensor:
+            if self.use_individual_proximity_sensors:
+                # Subscribe to individual proximity sensor topics (Range type)
+                sensor_order = ["N", "S", "E", "W"]
+                for i, direction in enumerate(sensor_order):
+                    sensor_id = self.proximity_sensor_mapping[i] if i < len(self.proximity_sensor_mapping) else (i + 1)
+                    self.create_subscription(
+                        Range,
+                        f"/proximity_distance{sensor_id}",
+                        lambda msg, d=direction: self._proximity_range_cb(msg, d),
+                        10,
+                    )
+                self.get_logger().info("=" * 60)
+                self.get_logger().info("REAL SENSOR MODE: Subscribing to individual proximity sensors")
+                self.get_logger().info(f"Sensor mapping [N,S,E,W]: {self.proximity_sensor_mapping}")
+                self.get_logger().info("Waiting for proximity sensor data...")
+                self.get_logger().info("=" * 60)
+            else:
+                # Subscribe to aggregated proximity_distance topic (Float32MultiArray)
+                self.proximity_sub = self.create_subscription(
+                    Float32MultiArray,
+                    "/proximity_distance",
+                    self._proximity_distance_cb,
+                    10,
+                )
+                self.get_logger().info("=" * 60)
+                self.get_logger().info("REAL SENSOR MODE: Subscribing to /proximity_distance")
+                self.get_logger().info("Waiting for proximity sensor data...")
+                self.get_logger().info("")
+                self.get_logger().warn("WARNING: If no data is received, check:")
+                self.get_logger().warn("  1. Is the proximity sensor publisher running?")
+                self.get_logger().warn("  2. Is /proximity_distance topic being published?")
+                self.get_logger().warn("  3. Check with: ros2 topic info /proximity_distance")
+                self.get_logger().info("=" * 60)
+                
+                # Start a timer to check if data is received
+                self.create_timer(5.0, self._check_proximity_data_received)
+        else:
+            for direction in SENSOR_CONFIGS:
+                self.create_subscription(
+                    Range,
+                    f"/link3_tof_{direction}/range",
+                    lambda msg, d=direction: self._tof_cb(msg, d),
+                    10,
+                )
+            self.get_logger().info("Using simulated ToF sensor data from /link3_tof_*/range")
 
         # Publishers
+        # Both simulation and real robot use /position_controllers/commands
+        # In simulation mode: only sim's controller_manager subscribes
+        # In real mode: both sim's and real's controller_manager subscribe
         self.cmd_pub = self.create_publisher(Float64MultiArray, "/position_controllers/commands", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/apf_debug/markers", 10)
 
         # APF enable/disable service
-        self.apf_enabled = True
+        self.apf_enabled = apf_enabled_on_start
         self.create_service(SetBool, "~/enable", self._enable_cb)
 
         # Control loop timer
         period = 1.0 / self.control_rate
         self.create_timer(period, self._control_loop)
 
-        self.get_logger().info("APF controller initialized")
+        state_str = "enabled" if self.apf_enabled else "disabled"
+        mode_str = "SIMULATION ONLY" if self.simulation_mode else "REAL + SIMULATION"
+        robot_mode_str = self.robot_mode.upper()
+        self.get_logger().info("=" * 60)
+        self.get_logger().info(f"APF controller initialized")
+        self.get_logger().info(f"  - Robot mode: {robot_mode_str}")
+        self.get_logger().info(f"  - Mode: {mode_str}")
+        self.get_logger().info(f"  - APF state: {state_str}")
+        self.get_logger().info(f"  - Sensor mode: {'REAL' if self.use_real_sensor else 'SIMULATED'}")
+        self.get_logger().info(f"  - d0 (repulsive range): {self.d0*1000:.1f}mm")
+        self.get_logger().info(f"  - k_rep (repulsive gain): {self.k_rep}")
+        if not self.simulation_mode:
+            self.get_logger().info(f"  - Real robot IP: {self.real_robot_ip}")
+        self.get_logger().info("=" * 60)
 
     def _enable_cb(self, request, response):
         self.apf_enabled = request.data
@@ -132,6 +225,7 @@ class APFController(Node):
         return response
 
     def _joint_states_cb(self, msg):
+        """Process simulation robot joint states."""
         if len(msg.position) < 6:
             return
         # Map by joint name to handle arbitrary ordering
@@ -140,12 +234,62 @@ class APFController(Node):
             self.q = np.array([name_to_pos[n] for n in self.joint_names])
         except KeyError:
             pass
+    
+    def _real_joint_states_cb(self, msg):
+        """Process real robot joint states."""
+        if len(msg.position) < 6:
+            return
+        # Map joint_1~6 to base~wrist3
+        joint_map = {
+            "joint_1": "base",
+            "joint_2": "shoulder",
+            "joint_3": "elbow",
+            "joint_4": "wrist1",
+            "joint_5": "wrist2",
+            "joint_6": "wrist3",
+        }
+        name_to_pos = dict(zip(msg.name, msg.position))
+        try:
+            mapped_positions = []
+            for joint_name in self.joint_names:
+                # Find corresponding joint_* name
+                for j1_name, mapped_name in joint_map.items():
+                    if mapped_name == joint_name and j1_name in name_to_pos:
+                        mapped_positions.append(name_to_pos[j1_name])
+                        break
+                else:
+                    return  # Missing joint
+
+            self.q_real = np.array(mapped_positions)
+
+            # Set initial pose once
+            if not self.initial_pose_synced and self.q_real is not None:
+                self.q_real_initial = self.q_real.copy()
+                if self.q is not None:
+                    # Sync simulation to real robot's initial pose
+                    self._sync_sim_to_real_initial()
+                self.initial_pose_synced = True
+                self.get_logger().info(
+                    f"Synced simulation to real robot initial pose: {self.q_real_initial}"
+                )
+        except Exception as e:
+            self.get_logger().warn(f"Error processing real joint states: {e}")
+
+    def _sync_sim_to_real_initial(self):
+        """Set simulation robot to real robot's initial pose."""
+        if self.q_real_initial is not None:
+            msg = Float64MultiArray()
+            msg.data = self.q_real_initial.tolist()
+            self.cmd_pub.publish(msg)
+            self.q = self.q_real_initial.copy()
 
     def _goal_cb(self, msg):
         self.p_goal = np.array([msg.point.x, msg.point.y, msg.point.z])
-        if not self.apf_enabled:
+        if not self.apf_enabled and self.auto_enable_on_goal:
             self.apf_enabled = True
             self.get_logger().info("APF auto-enabled by new goal")
+        elif not self.apf_enabled:
+            self.get_logger().warn("Goal received but APF is disabled. Enable APF manually to start control.")
         self.get_logger().info(
             f"Goal received: [{self.p_goal[0]:.3f}, {self.p_goal[1]:.3f}, {self.p_goal[2]:.3f}]"
         )
@@ -158,6 +302,149 @@ class APFController(Node):
             self.tof_filtered[direction] = raw
         else:
             self.tof_filtered[direction] = alpha * raw + (1.0 - alpha) * prev
+
+    def _proximity_range_cb(self, msg, direction):
+        """Process individual proximity sensor Range message.
+        
+        Converts Range message (may be in mm or meters) to meters and applies EMA filter.
+        """
+        # Convert from mm to meters if needed
+        # Proximity sensors typically publish in mm (range > 1.0 or max_range > 10.0)
+        if msg.range > 1.0 or msg.max_range > 10.0:
+            raw_m = msg.range / 1000.0  # mm to meters
+            max_range_m = msg.max_range / 1000.0
+        else:
+            raw_m = msg.range  # already in meters
+            max_range_m = msg.max_range
+        
+        # Clamp to valid range
+        if raw_m < 0:
+            raw_m = 0.0
+        if raw_m > max_range_m:
+            raw_m = max_range_m
+        
+        # Apply EMA filter
+        alpha = self.ema_alpha
+        prev = self.tof_filtered[direction]
+        if math.isinf(prev):
+            self.tof_filtered[direction] = raw_m
+        else:
+            self.tof_filtered[direction] = alpha * raw_m + (1.0 - alpha) * prev
+        
+        # Log first message only
+        if not hasattr(self, '_proximity_range_logged'):
+            self._proximity_range_logged = {}
+        if direction not in self._proximity_range_logged:
+            self._proximity_range_logged[direction] = True
+            self.get_logger().info(
+                f"Proximity sensor {direction} connected: "
+                f"{msg.range:.1f}mm -> {raw_m*1000:.1f}mm (filtered: {self.tof_filtered[direction]*1000:.1f}mm)"
+            )
+
+    def _check_proximity_data_received(self):
+        """Check if proximity data has been received (called periodically)."""
+        if self.use_real_sensor:
+            if not hasattr(self, '_proximity_first_msg'):
+                self.get_logger().warn(
+                    "⚠️  No proximity_distance data received yet! "
+                    "Check if the sensor publisher is running."
+                )
+                # Check topic info
+                import subprocess
+                try:
+                    result = subprocess.run(
+                        ["ros2", "topic", "info", "/proximity_distance"],
+                        capture_output=True,
+                        text=True,
+                        timeout=1.0
+                    )
+                    if "Publisher count: 0" in result.stdout:
+                        self.get_logger().error(
+                            "❌ No publisher found for /proximity_distance topic!"
+                        )
+                        self.get_logger().info(
+                            "   Start the proximity sensor publisher or ecan_driver node."
+                        )
+                except:
+                    pass
+
+    def _proximity_distance_cb(self, msg):
+        """Process proximity_distance topic (Float32MultiArray, mm).
+        
+        Expected format: [N, S, E, W] distances in mm.
+        If array has fewer elements, map to available sensors.
+        """
+        if not hasattr(self, '_proximity_first_msg'):
+            self._proximity_first_msg = True
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("*** FIRST proximity_distance message received! ***")
+            self.get_logger().info(f"Message type: {type(msg).__name__}")
+            self.get_logger().info(f"Message data: {msg.data}")
+            self.get_logger().info("=" * 60)
+        
+        if not msg.data:
+            self.get_logger().warn("Received empty proximity_distance message (msg.data is empty)")
+            return
+        
+        # Map array elements to sensor directions
+        # Expected order: [N, S, E, W] or at least first element for all sensors
+        sensor_order = ["N", "S", "E", "W"]
+        
+        # Debug: log first few messages to verify data reception
+        if not hasattr(self, '_proximity_msg_count'):
+            self._proximity_msg_count = 0
+        self._proximity_msg_count += 1
+        if self._proximity_msg_count <= 3:
+            self.get_logger().info(
+                f"[MSG #{self._proximity_msg_count}] Proximity data: {len(msg.data)} values, "
+                f"data={[f'{d:.1f}' for d in msg.data[:4]]}mm"
+            )
+        
+        # If only one value, use it for all sensors (minimum distance mode)
+        if len(msg.data) == 1:
+            raw_mm = msg.data[0]
+            raw_m = raw_mm / 1000.0  # mm to meters
+            # Clamp to max range
+            if raw_mm > self.proximity_max_range_mm:
+                raw_m = self.proximity_max_range_mm / 1000.0
+            
+            # Apply to all sensors
+            for direction in sensor_order:
+                alpha = self.ema_alpha
+                prev = self.tof_filtered[direction]
+                if math.isinf(prev):
+                    self.tof_filtered[direction] = raw_m
+                else:
+                    self.tof_filtered[direction] = alpha * raw_m + (1.0 - alpha) * prev
+            
+            if self._proximity_msg_count <= 5:
+                self.get_logger().info(
+                    f"Applied single value {raw_mm:.1f}mm ({raw_m*1000:.1f}mm after clamp) "
+                    f"to all sensors, filtered={self.tof_filtered['N']*1000:.1f}mm"
+                )
+        else:
+            # Multiple values: map to sensors in order [N, S, E, W]
+            for i, direction in enumerate(sensor_order):
+                if i < len(msg.data):
+                    raw_mm = msg.data[i]
+                    raw_m = raw_mm / 1000.0  # mm to meters
+                    # Clamp to max range
+                    if raw_mm > self.proximity_max_range_mm:
+                        raw_m = self.proximity_max_range_mm / 1000.0
+                    
+                    alpha = self.ema_alpha
+                    prev = self.tof_filtered[direction]
+                    if math.isinf(prev):
+                        self.tof_filtered[direction] = raw_m
+                    else:
+                        self.tof_filtered[direction] = alpha * raw_m + (1.0 - alpha) * prev
+            
+            if self._proximity_msg_count <= 5:
+                filtered_str = ", ".join([f"{self.tof_filtered[d]*1000:.1f}" for d in sensor_order])
+                self.get_logger().info(
+                    f"Mapped {len(msg.data)} values to sensors [N,S,E,W], "
+                    f"filtered distances (mm): [{filtered_str}]"
+                )
 
     def _control_loop(self):
         # Guard: need joint states
@@ -207,10 +494,24 @@ class APFController(Node):
         tau_rep = np.zeros(6)
         rep_arrows = []  # For visualization: list of (position, force_vector)
 
+        # Debug: log sensor distances periodically
+        if not hasattr(self, '_rep_force_log_count'):
+            self._rep_force_log_count = 0
+        self._rep_force_log_count += 1
+        should_log = (self._rep_force_log_count % 100 == 0)  # Log every 100 control cycles (~1 second at 100Hz)
+
         for direction, p_sensor, R_sensor_world in sensor_vis:
             cfg = SENSOR_CONFIGS[direction]
             r_raw = self.tof_filtered[direction]
             r_i = max(r_raw, self.r_min)
+
+            # Debug logging
+            if should_log:
+                self.get_logger().info(
+                    f"Sensor {direction}: raw={r_raw*1000:.1f}mm, "
+                    f"r_i={r_i*1000:.1f}mm, d0={self.d0*1000:.1f}mm, "
+                    f"active={'YES' if r_i <= self.d0 else 'NO (too far)'}"
+                )
 
             if r_i > self.d0:
                 continue
@@ -222,6 +523,12 @@ class APFController(Node):
             alpha_i = self.k_rep * (1.0 / r_i - 1.0 / self.d0) / (r_i * r_i)
             F_rep_i = alpha_i * n_i
 
+            if should_log:
+                self.get_logger().info(
+                    f"  -> Repulsive force {direction}: |F|={np.linalg.norm(F_rep_i):.3f}N, "
+                    f"alpha={alpha_i:.3f}"
+                )
+
             # Sensor point Jacobian (3x6, padded with zeros for joints 4-6)
             offset_world = R_link3 @ cfg["offset"]
             J_si = np.zeros((3, 6))
@@ -231,6 +538,16 @@ class APFController(Node):
             # Accumulate repulsive torque
             tau_rep += J_si.T @ F_rep_i
             rep_arrows.append((p_sensor, F_rep_i))
+        
+        if should_log and len(rep_arrows) > 0:
+            self.get_logger().info(
+                f"Total repulsive forces: {len(rep_arrows)} sensors active, "
+                f"|tau_rep|={np.linalg.norm(tau_rep):.3f}"
+            )
+        elif should_log:
+            self.get_logger().warn(
+                f"No repulsive forces active! All sensors beyond d0={self.d0*1000:.1f}mm"
+            )
 
         # --- Total joint torque ---
         tau = J_ee_v.T @ F_att + tau_rep
@@ -428,8 +745,14 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except:
+            pass
+        try:
+            rclpy.shutdown()
+        except:
+            pass
 
 
 if __name__ == "__main__":

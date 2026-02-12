@@ -43,6 +43,7 @@ def generate_launch_description():
                 'robot_description': ParameterValue(
                     robot_description, value_type=str
                 ),
+                'use_sim_time': False,
             }],
         ),
 
@@ -81,13 +82,21 @@ def generate_launch_description():
             output='screen',
         ),
 
-        # Joint State Publisher (relay)
+        # Joint State Mapper - converts joint_1~6 to base~wrist3
+        Node(
+            package='rbpodo_proximity_controller',
+            executable='joint_state_mapper',
+            name='joint_state_mapper',
+            output='screen',
+        ),
+        
+        # Joint State Publisher (relay) - uses mapped joint states
         Node(
             package='joint_state_publisher',
             executable='joint_state_publisher',
             name='joint_state_publisher',
             parameters=[{
-                'source_list': ['rbpodo/joint_states'],
+                'source_list': ['/joint_states_mapped'],
                 'rate': 30,
             }],
         ),
@@ -128,5 +137,6 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2',
             output='screen',
+            arguments=['-d', os.path.join(pkg, 'config', 'proximity_demo.rviz')] if os.path.exists(os.path.join(pkg, 'config', 'proximity_demo.rviz')) else [],
         ),
     ])
