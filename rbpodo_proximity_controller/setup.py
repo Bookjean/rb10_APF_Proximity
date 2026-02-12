@@ -16,6 +16,8 @@ setup(
             glob('config/*')),
         (os.path.join('share', package_name, 'launch'),
             glob('launch/*.py')),
+        (os.path.join('share', package_name, 'scripts'),
+            [p for p in glob('scripts/*') if os.path.isfile(p)]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -31,6 +33,8 @@ setup(
             'waypoint_manager = rbpodo_proximity_controller.waypoint_manager:main',
             'fake_proximity_publisher = rbpodo_proximity_controller.fake_proximity_publisher:main',
             'joint_state_mapper = rbpodo_proximity_controller.joint_state_mapper:main',
+            'apf_on = rbpodo_proximity_controller.apf_on:main',
+            'apf_off = rbpodo_proximity_controller.apf_off:main',
         ],
     },
 )

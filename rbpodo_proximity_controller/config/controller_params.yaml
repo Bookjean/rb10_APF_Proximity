@@ -9,6 +9,7 @@ proximity_controller:
     k_att: 2.0
     k_rep: 5.0
     k_q: 1.0
+    k_hold: 2.0             # hold mode attractive gain (APF ON, no trajectory)
     v_max: 1.0
     d0: 0.10              # proximity sensor influence distance (m) = 100mm (10cm)
     ema_alpha: 0.3

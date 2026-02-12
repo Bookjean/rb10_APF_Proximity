@@ -1,5 +1,10 @@
 """Proximity sensor-based APF controller with waypoint P2P motion.
 
+Three operating modes:
+  1. IDLE  (APF off)  - visualization only, no commands
+  2. HOLD  (APF on, no trajectory) - hold anchor position, dodge obstacles
+  3. EXECUTING (APF on + trajectory) - waypoint following with obstacle avoidance
+
 Moves through multiple waypoints sequentially while avoiding obstacles
 detected by a proximity sensor (ecan_driver), using Artificial Potential
 Field method with sensor-point Jacobian.
@@ -63,6 +68,7 @@ class ProximityController(Node):
         self.declare_parameter('k_att', 2.0)
         self.declare_parameter('k_rep', 5.0)
         self.declare_parameter('k_q', 1.0)
+        self.declare_parameter('k_hold', 2.0)
         self.declare_parameter('v_max', 1.0)
         self.declare_parameter('q_limit_margin', 0.1)
         self.declare_parameter('goal_tolerance', 0.005)
@@ -74,6 +80,7 @@ class ProximityController(Node):
         self.declare_parameter('sensor_fov', 1.7)
         self.declare_parameter('sensor_range', 0.2)
         self.declare_parameter('sensor_marker_size', 0.1)
+        self.declare_parameter('auto_execute', False)
 
         # Read parameters
         self.control_rate = self.get_parameter('control_rate').value
@@ -84,6 +91,7 @@ class ProximityController(Node):
         self.k_att = self.get_parameter('k_att').value
         self.k_rep = self.get_parameter('k_rep').value
         self.k_q = self.get_parameter('k_q').value
+        self.k_hold = self.get_parameter('k_hold').value
         self.v_max = self.get_parameter('v_max').value
         self.q_limit_margin = self.get_parameter('q_limit_margin').value
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
@@ -98,6 +106,7 @@ class ProximityController(Node):
         self.sensor_marker_size = self.get_parameter(
             'sensor_marker_size'
         ).value
+        self.auto_execute = self.get_parameter('auto_execute').value
 
         # Build KDL chains
         ee_offset = self.get_parameter('ee_offset').value
@@ -118,6 +127,8 @@ class ProximityController(Node):
         self.current_waypoint_idx = 0
         self.executing = False
         self.enabled = False
+        self.q_anchor = None  # anchor joint position for hold mode
+        self._auto_execute_done = False  # track if auto_execute already fired
 
         # Subscribers
         self.create_subscription(
@@ -157,15 +168,33 @@ class ProximityController(Node):
         period = 1.0 / self.control_rate
         self.create_timer(period, self._control_loop)
 
-        self.get_logger().info('Proximity controller initialized')
+        self.get_logger().info(
+            f'Proximity controller initialized '
+            f'(k_att={self.k_att}, k_rep={self.k_rep}, '
+            f'k_hold={self.k_hold}, d0={self.d0*1000:.0f}mm)'
+        )
 
     # --- Callbacks ---
 
     def _enable_cb(self, request, response):
         self.enabled = request.data
-        if not self.enabled:
+        if self.enabled:
+            # Capture current position as anchor for hold mode
+            if self.q is not None:
+                self.q_anchor = self.q.copy()
+                self.get_logger().info(
+                    f'APF enabled - anchor: '
+                    f'[{", ".join(f"{v:.4f}" for v in self.q_anchor)}]'
+                )
+            else:
+                self.get_logger().warn(
+                    'APF enabled but no joint state yet - '
+                    'anchor will be set on first reading'
+                )
+        else:
             self.executing = False
-        state = 'enabled' if self.enabled else 'disabled'
+            self.q_anchor = None
+        state = 'enabled (HOLD mode)' if self.enabled else 'disabled'
         response.success = True
         response.message = f'Controller {state}'
         self.get_logger().info(response.message)
@@ -184,6 +213,9 @@ class ProximityController(Node):
         self.current_waypoint_idx = 0
         self.executing = True
         self.enabled = True
+        # Keep anchor for fallback after trajectory completes
+        if self.q_anchor is None:
+            self.q_anchor = self.q.copy()
         response.success = True
         response.message = (
             f'Executing {len(self.waypoints)} waypoints '
@@ -194,8 +226,11 @@ class ProximityController(Node):
 
     def _stop_cb(self, request, response):
         self.executing = False
+        # Update anchor to current position (hold here)
+        if self.q is not None:
+            self.q_anchor = self.q.copy()
         response.success = True
-        response.message = 'Execution stopped'
+        response.message = 'Execution stopped, switching to HOLD mode'
         self.get_logger().info(response.message)
         return response
 
@@ -231,10 +266,7 @@ class ProximityController(Node):
         self.proximity_distance = raw_mm
 
     def _proximity_range_cb(self, msg, sensor_id):
-        """Process individual proximity sensor Range message.
-        
-        msg.range is in meters.
-        """
+        """Process individual proximity sensor Range message."""
         if msg.range >= 0 and msg.range <= msg.max_range:
             self.proximity_ranges[sensor_id] = msg.range
 
@@ -257,6 +289,103 @@ class ProximityController(Node):
             waypoints.append(wp)
         self.waypoints = waypoints
 
+        # Auto-execute: start trajectory when waypoints first arrive
+        if (self.auto_execute and not self._auto_execute_done
+                and len(waypoints) > 0 and self.q is not None):
+            self._auto_execute_done = True
+            self.current_waypoint_idx = 0
+            self.executing = True
+            self.enabled = True
+            if self.q_anchor is None:
+                self.q_anchor = self.q.copy()
+            self.get_logger().info(
+                f'Auto-executing {len(waypoints)} waypoints'
+            )
+
+    # --- Helper Methods ---
+
+    def _compute_sensor_vis(self, q, p_link3, R_link3):
+        """Compute sensor world poses for visualization and force calculation."""
+        sensor_vis = []
+        for direction, cfg in SENSOR_CONFIGS.items():
+            R_sw = R_link3 @ self.sensor_R_local[direction]
+            p_s = p_link3 + R_link3 @ cfg['offset']
+            sensor_vis.append((direction, p_s, R_sw))
+        return sensor_vis
+
+    def _compute_repulsive_forces(self, q, R_link3, sensor_vis):
+        """Compute repulsive joint torques from proximity sensors.
+
+        Returns:
+            tau_rep: (6,) repulsive joint torques
+            rep_arrows: list of (position, force) for visualization
+        """
+        tau_rep = np.zeros(6)
+        rep_arrows = []
+
+        r_i = max(self.proximity_filtered, self.r_min)
+        if r_i >= self.d0:
+            return tau_rep, rep_arrows
+
+        J3_full = compute_jacobian(self.chain_link3, q[:3])
+        J3_v = J3_full[:3, :]
+        J3_w = J3_full[3:, :]
+
+        for direction, p_sensor, R_sensor_world in sensor_vis:
+            cfg = SENSOR_CONFIGS[direction]
+
+            # Sensor normal in world frame
+            n_i = -(R_sensor_world @ np.array([1.0, 0.0, 0.0]))
+
+            # Repulsive magnitude
+            alpha_i = (
+                self.k_rep * (1.0 / r_i - 1.0 / self.d0) / (r_i * r_i)
+            )
+            F_rep_i = alpha_i * n_i
+
+            # Sensor point Jacobian (3x6)
+            offset_world = R_link3 @ cfg['offset']
+            J_si = np.zeros((3, 6))
+            for j in range(3):
+                J_si[:, j] = (
+                    J3_v[:, j] + np.cross(J3_w[:, j], offset_world)
+                )
+
+            tau_rep += J_si.T @ F_rep_i
+            rep_arrows.append((p_sensor, F_rep_i))
+
+        return tau_rep, rep_arrows
+
+    def _integrate(self, q, tau):
+        """Convert joint torque to velocity, apply limits, integrate.
+
+        Returns:
+            q_next: (6,) next joint positions
+        """
+        qdot = self.k_q * tau
+
+        # Velocity saturation
+        max_qdot = np.max(np.abs(qdot))
+        if max_qdot > self.v_max:
+            qdot = qdot * (self.v_max / max_qdot)
+
+        # Joint limit damping
+        for i in range(6):
+            dist_low = q[i] - self.q_min[i]
+            dist_high = self.q_max[i] - q[i]
+            margin = self.q_limit_margin
+            if dist_low < margin and qdot[i] < 0:
+                scale = max(dist_low / margin, 0.0)
+                qdot[i] *= scale
+            if dist_high < margin and qdot[i] > 0:
+                scale = max(dist_high / margin, 0.0)
+                qdot[i] *= scale
+
+        # Integrate position
+        q_next = q + qdot * self.dt
+        q_next = np.clip(q_next, self.q_min, self.q_max)
+        return q_next
+
     # --- Control Loop ---
 
     def _control_loop(self):
@@ -273,127 +402,118 @@ class ProximityController(Node):
         frame_link3 = compute_fk(self.chain_link3, q[:3])
         p_link3, R_link3 = kdl_frame_to_pos_rot(frame_link3)
 
-        # Sensor world poses for visualization
-        sensor_vis = []
-        for direction, cfg in SENSOR_CONFIGS.items():
-            R_sw = R_link3 @ self.sensor_R_local[direction]
-            p_s = p_link3 + R_link3 @ cfg['offset']
-            sensor_vis.append((direction, p_s, R_sw))
+        # Sensor world poses
+        sensor_vis = self._compute_sensor_vis(q, p_link3, R_link3)
 
-        # Not executing or not enabled: just publish viz
-        if not self.enabled or not self.executing:
+        # =============================================================
+        # MODE 1: APF DISABLED (IDLE) - visualization only
+        # =============================================================
+        if not self.enabled:
             self._publish_markers(
                 p_ee, None, np.zeros(3), [], sensor_vis, q
             )
             return
 
-        # Check if all waypoints completed
-        if self.current_waypoint_idx >= len(self.waypoints):
-            self.executing = False
-            self.get_logger().info('All waypoints completed!')
-            self._publish_cmd(q)
-            self._publish_markers(
-                p_ee, None, np.zeros(3), [], sensor_vis, q
-            )
-            return
-
-        # Current target waypoint (joint space)
-        target_q = self.waypoints[self.current_waypoint_idx]
-
-        # Compute target EE position via FK
-        frame_target = compute_fk(self.chain_ee, target_q)
-        p_target, _ = kdl_frame_to_pos_rot(frame_target)
-
-        # Check waypoint reached (joint space tolerance)
-        joint_error = np.linalg.norm(target_q - q)
-        if joint_error < self.waypoint_tolerance:
+        # Lazy anchor initialization
+        if self.q_anchor is None:
+            self.q_anchor = q.copy()
             self.get_logger().info(
-                f'Waypoint {self.current_waypoint_idx} reached '
-                f'(error: {joint_error:.4f} rad)'
+                f'Anchor set (deferred): '
+                f'[{", ".join(f"{v:.4f}" for v in self.q_anchor)}]'
             )
-            self.current_waypoint_idx += 1
-            self._publish_cmd(q)
+
+        # =============================================================
+        # MODE 3: APF ON + TRAJECTORY (EXECUTING)
+        # =============================================================
+        if self.executing:
+            # Check if all waypoints completed
+            if self.current_waypoint_idx >= len(self.waypoints):
+                self.executing = False
+                self.q_anchor = q.copy()
+                self.get_logger().info(
+                    'All waypoints completed! Switching to HOLD mode.'
+                )
+                self._publish_cmd(q)
+                self._publish_markers(
+                    p_ee, None, np.zeros(3), [], sensor_vis, q
+                )
+                return
+
+            # Current target waypoint (joint space)
+            target_q = self.waypoints[self.current_waypoint_idx]
+
+            # Compute target EE position via FK
+            frame_target = compute_fk(self.chain_ee, target_q)
+            p_target, _ = kdl_frame_to_pos_rot(frame_target)
+
+            # Check waypoint reached (joint space tolerance)
+            joint_error = np.linalg.norm(target_q - q)
+            if joint_error < self.waypoint_tolerance:
+                self.get_logger().info(
+                    f'Waypoint {self.current_waypoint_idx} reached '
+                    f'(error: {joint_error:.4f} rad)'
+                )
+                self.current_waypoint_idx += 1
+                self._publish_cmd(q)
+                self._publish_markers(
+                    p_ee, p_target, np.zeros(3), [], sensor_vis, q
+                )
+                return
+
+            # Attractive force toward waypoint (task-space + joint-space)
+            J_ee_full = compute_jacobian(self.chain_ee, q)
+            J_ee_v = J_ee_full[:3, :]
+            F_att = self.k_att * (p_target - p_ee)
+            q_err = target_q - q
+            tau_att_joint = 0.5 * self.k_att * q_err
+            tau_att = J_ee_v.T @ F_att + tau_att_joint
+
+            # Repulsive forces
+            tau_rep, rep_arrows = self._compute_repulsive_forces(
+                q, R_link3, sensor_vis
+            )
+
+            # Integrate and publish
+            tau = tau_att + tau_rep
+            q_next = self._integrate(q, tau)
+            self._publish_cmd(q_next)
             self._publish_markers(
-                p_ee, p_target, np.zeros(3), [], sensor_vis, q
+                p_ee, p_target, F_att, rep_arrows, sensor_vis, q
             )
             return
 
-        # --- Jacobians ---
-        J_ee_full = compute_jacobian(self.chain_ee, q)  # (6,6)
-        J_ee_v = J_ee_full[:3, :]  # linear velocity part (3,6)
+        # =============================================================
+        # MODE 2: APF ON + NO TRAJECTORY (HOLD)
+        # =============================================================
+        # Attractive force: joint-space pull toward anchor
+        tau_att_hold = self.k_hold * (self.q_anchor - q)
 
-        J3_full = compute_jacobian(self.chain_link3, q[:3])  # (6,3)
-        J3_v = J3_full[:3, :]  # (3,3)
-        J3_w = J3_full[3:, :]  # (3,3)
+        # Repulsive forces
+        tau_rep, rep_arrows = self._compute_repulsive_forces(
+            q, R_link3, sensor_vis
+        )
 
-        # --- Attractive force (task space) ---
-        F_att = self.k_att * (p_target - p_ee)
+        tau = tau_att_hold + tau_rep
 
-        # --- Attractive force (joint space, blended) ---
-        # Add joint-space attractive component for better convergence
-        q_err = target_q - q
-        tau_att_joint = 0.5 * self.k_att * q_err
+        # Skip if at anchor with no obstacles (avoid jitter)
+        if np.max(np.abs(tau)) < 1e-6:
+            # Compute anchor EE position for visualization
+            frame_anchor = compute_fk(self.chain_ee, self.q_anchor)
+            p_anchor, _ = kdl_frame_to_pos_rot(frame_anchor)
+            self._publish_markers(
+                p_ee, p_anchor, np.zeros(3), rep_arrows, sensor_vis, q
+            )
+            return
 
-        # --- Repulsive forces from proximity sensor ---
-        tau_rep = np.zeros(6)
-        rep_arrows = []
-
-        r_i = max(self.proximity_filtered, self.r_min)
-        if r_i < self.d0:
-            for direction, p_sensor, R_sensor_world in sensor_vis:
-                cfg = SENSOR_CONFIGS[direction]
-
-                # Sensor normal in world frame
-                n_i = -(R_sensor_world @ np.array([1.0, 0.0, 0.0]))
-
-                # Repulsive magnitude
-                alpha_i = (
-                    self.k_rep * (1.0 / r_i - 1.0 / self.d0) / (r_i * r_i)
-                )
-                F_rep_i = alpha_i * n_i
-
-                # Sensor point Jacobian (3x6)
-                offset_world = R_link3 @ cfg['offset']
-                J_si = np.zeros((3, 6))
-                for j in range(3):
-                    J_si[:, j] = (
-                        J3_v[:, j] + np.cross(J3_w[:, j], offset_world)
-                    )
-
-                tau_rep += J_si.T @ F_rep_i
-                rep_arrows.append((p_sensor, F_rep_i))
-
-        # --- Total joint torque ---
-        tau = J_ee_v.T @ F_att + tau_att_joint + tau_rep
-
-        # --- Joint velocity ---
-        qdot = self.k_q * tau
-
-        # --- Velocity saturation ---
-        max_qdot = np.max(np.abs(qdot))
-        if max_qdot > self.v_max:
-            qdot = qdot * (self.v_max / max_qdot)
-
-        # --- Joint limit damping ---
-        for i in range(6):
-            dist_low = q[i] - self.q_min[i]
-            dist_high = self.q_max[i] - q[i]
-            margin = self.q_limit_margin
-            if dist_low < margin and qdot[i] < 0:
-                scale = max(dist_low / margin, 0.0)
-                qdot[i] *= scale
-            if dist_high < margin and qdot[i] > 0:
-                scale = max(dist_high / margin, 0.0)
-                qdot[i] *= scale
-
-        # --- Integrate position ---
-        q_next = q + qdot * self.dt
-        q_next = np.clip(q_next, self.q_min, self.q_max)
-
-        # --- Publish ---
+        q_next = self._integrate(q, tau)
         self._publish_cmd(q_next)
+
+        # Anchor EE position for visualization
+        frame_anchor = compute_fk(self.chain_ee, self.q_anchor)
+        p_anchor, _ = kdl_frame_to_pos_rot(frame_anchor)
+        F_att_vis = self.k_hold * (p_anchor - p_ee)
         self._publish_markers(
-            p_ee, p_target, F_att, rep_arrows, sensor_vis, q
+            p_ee, p_anchor, F_att_vis, rep_arrows, sensor_vis, q
         )
 
     # --- Publishers ---
@@ -430,7 +550,7 @@ class ProximityController(Node):
         m.lifetime = lifetime
         ma.markers.append(m)
 
-        # Target waypoint sphere (yellow)
+        # Target/Anchor sphere (yellow)
         m = Marker()
         m.header.stamp = stamp
         m.header.frame_id = frame_id
@@ -478,7 +598,7 @@ class ProximityController(Node):
             marker_id += 1
             ma.markers.append(m)
 
-        # All waypoints as spheres (small, gray for pending, orange for current)
+        # All waypoints as spheres
         for i, wp in enumerate(self.waypoints):
             frame_wp = compute_fk(self.chain_ee, wp)
             p_wp, _ = kdl_frame_to_pos_rot(frame_wp)
@@ -537,7 +657,6 @@ class ProximityController(Node):
             ma.markers.append(m)
 
         # Sensor position spheres (cyan) with distance info
-        sensor_directions = ['N', 'S', 'E', 'W']
         for idx, (direction, p_s, R_sw) in enumerate(sensor_vis):
             # Sensor sphere
             m = Marker()
@@ -559,9 +678,9 @@ class ProximityController(Node):
             m.color.a = 0.8
             m.lifetime = lifetime
             ma.markers.append(m)
-            
+
             # Distance text (if available)
-            sensor_id = idx + 1  # 1-4 for N, S, E, W
+            sensor_id = idx + 1
             if sensor_id in self.proximity_ranges:
                 dist_m = self.proximity_ranges[sensor_id]
                 dist_mm = dist_m * 1000.0
@@ -585,9 +704,9 @@ class ProximityController(Node):
                 m_text.text = f'{direction}: {dist_mm:.0f}mm'
                 m_text.lifetime = lifetime
                 ma.markers.append(m_text)
-                
-                # Distance arrow/line (if distance is valid)
-                if dist_m > 0 and dist_m < 0.5:  # Show if within 50cm
+
+                # Distance arrow
+                if dist_m > 0 and dist_m < 0.5:
                     look_dir = -(R_sw @ np.array([1.0, 0.0, 0.0]))
                     end_point = p_s + look_dir * dist_m
                     m_arrow = Marker()
@@ -599,8 +718,14 @@ class ProximityController(Node):
                     m_arrow.type = Marker.ARROW
                     m_arrow.action = Marker.ADD
                     m_arrow.points = [
-                        Point(x=float(p_s[0]), y=float(p_s[1]), z=float(p_s[2])),
-                        Point(x=float(end_point[0]), y=float(end_point[1]), z=float(end_point[2]))
+                        Point(
+                            x=float(p_s[0]), y=float(p_s[1]),
+                            z=float(p_s[2])
+                        ),
+                        Point(
+                            x=float(end_point[0]), y=float(end_point[1]),
+                            z=float(end_point[2])
+                        ),
                     ]
                     m_arrow.scale.x = 0.01
                     m_arrow.scale.y = 0.02
@@ -612,7 +737,7 @@ class ProximityController(Node):
                     m_arrow.lifetime = lifetime
                     ma.markers.append(m_arrow)
 
-        # Proximity status text
+        # Status text
         m = Marker()
         m.header.stamp = stamp
         m.header.frame_id = frame_id
@@ -632,7 +757,12 @@ class ProximityController(Node):
         m.color.a = 1.0
         m.lifetime = lifetime
 
-        status = 'EXECUTING' if self.executing else 'IDLE'
+        if self.executing:
+            status = 'EXECUTING'
+        elif self.enabled:
+            status = 'HOLD'
+        else:
+            status = 'IDLE'
         prox_mm = self.proximity_distance if self.proximity_distance else 0.0
         wp_info = (
             f'{self.current_waypoint_idx}/{len(self.waypoints)}'
